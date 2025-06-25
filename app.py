@@ -5,7 +5,6 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
 import pandas as pd
-import pandas_ta as ta
 from datetime import datetime, timedelta
 import random
 import json
@@ -23,11 +22,16 @@ app = Flask(__name__)
 # CORS(app, origins=["https://aura-trading-bot-frontend.vercel.app", "http://localhost:3000"])
 CORS(app)
 
+# config.py
+import os # Make sure this import is at the top of your config.py
+
 # --- Configuration ---
 BYBIT_API_KEY = os.environ.get('BYBIT_API_KEY')
 BYBIT_API_SECRET = os.environ.get('BYBIT_API_SECRET')
-GOOGLE_API_KEY = os.environ.get('GOOGLE_API_KEY')
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY') # <--- CORRECTED THIS LINE
 
+# Custom App ID for Firestore collection paths to separate data for different deployments
+APP_ID = os.environ.get('APP_ID') # Assuming you use os.environ.get for consistency here too
 # Initialize Bybit client
 if BYBIT_API_KEY and BYBIT_API_SECRET:
     bybit_client = HTTP(
