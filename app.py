@@ -5,6 +5,7 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 from pybit.unified_trading import HTTP
 import pandas as pd
+# Removed: import pandas_ta as ta # No longer using pandas_ta
 from datetime import datetime, timedelta
 import random
 import json
@@ -12,51 +13,50 @@ import numpy as np
 import time
 import traceback
 
-# Load environment variables from .env file
+# Load environment variables from .env file (primarily for local development)
 load_dotenv()
 
 app = Flask(__name__)
-# Configure CORS to allow requests from your Vercel frontend.
-# For now, allowing all origins is easiest for debugging.
-# For production, consider being more specific:
-# CORS(app, origins=["https://aura-trading-bot-frontend.vercel.app", "http://localhost:3000"])
 CORS(app)
 
-# config.py
-import os # Make sure this import is at the top of your config.py
+# --- Configuration (using os.getenv for consistency with Render setup) ---
+BYBIT_API_KEY = os.getenv('BYBIT_API_KEY')
+BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET')
+# Corrected: Use GEMINI_API_KEY as per Render environment variable name
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY') 
 
-# --- Configuration ---
-BYBIT_API_KEY = os.environ.get('BYBIT_API_KEY')
-BYBIT_API_SECRET = os.environ.get('BYBIT_API_SECRET')
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY') # <--- CORRECTED THIS LINE
-
-# Custom App ID for Firestore collection paths to separate data for different deployments
-APP_ID = os.environ.get('APP_ID') # Assuming you use os.environ.get for consistency here too
 # Initialize Bybit client
+bybit_client = None
 if BYBIT_API_KEY and BYBIT_API_SECRET:
-    bybit_client = HTTP(
-        api_key=BYBIT_API_KEY,
-        api_secret=BYBIT_API_SECRET,
-        testnet=False, # Set to True for testnet
-        timeout=30 # Increased timeout to 30 seconds
-    )
-    print("--- Bybit client initialized ---")
+    try:
+        bybit_client = HTTP(
+            api_key=BYBIT_API_KEY,
+            api_secret=BYBIT_API_SECRET,
+            testnet=False, # Set to True for testnet
+            timeout=30 # Increased timeout to 30 seconds
+        )
+        print("--- Bybit client initialized ---")
+    except Exception as e:
+        print(f"--- ERROR: Failed to initialize Bybit client: {e} ---")
 else:
-    bybit_client = None
     print("--- Bybit API keys not found. Bybit client not initialized. ---")
 
 # Initialize Google Gemini
+gemini_model = None
 try:
-    import google.generativeai as genai
-    genai.configure(api_key=GOOGLE_API_KEY)
-    gemini_model = genai.GenerativeModel('gemini-2.0-flash') # Using gemini-2.0-flash
-    print("--- Successfully initialized model to gemini-2.0-flash at startup ---")
+    if GEMINI_API_KEY:
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY) # Corrected API key name
+        gemini_model = genai.GenerativeModel('gemini-2.0-flash') # Using gemini-2.0-flash
+        print("--- Successfully initialized model to gemini-2.0-flash at startup ---")
+    else:
+        print("--- WARNING: GEMINI_API_KEY environment variable not set. Gemini model not initialized. ---")
 except Exception as e:
     gemini_model = None
     print(f"--- Failed to initialize Gemini model: {e} ---")
+    traceback.print_exc()
 
 # --- Health Check / Root Route (ADDED FOR RENDER) ---
-# Render expects a successful response from the root route to consider the service "live".
 @app.route('/')
 def home():
     """A basic health check endpoint for Render deployment."""
@@ -86,18 +86,30 @@ def get_indicator_value(df, indicator_name, default_val="N/A"):
 # Function to fetch live market data (for dashboard)
 @app.route('/all_market_prices', methods=['GET'])
 def get_all_market_prices():
+    # Caching mechanism (if you want to keep it, otherwise remove these global vars)
+    global last_market_data, last_fetch_time # Ensure these are defined globally if used
+    # last_market_data = None # Uncomment and initialize if not done elsewhere
+    # last_fetch_time = 0 # Uncomment and initialize if not done elsewhere
+    CACHE_DURATION = 30 # Seconds
+
+    if 'last_market_data' in globals() and last_market_data and (time.time() - last_fetch_time < CACHE_DURATION):
+        app.logger.info("Serving dashboard market data from cache.")
+        return jsonify(last_market_data)
+
+    app.logger.info("Fetching new dashboard market data from Bybit.")
+    
     if not bybit_client:
-        print("Error: Bybit client not initialized in get_all_market_prices.")
+        app.logger.error("Error: Bybit client not initialized in get_all_market_prices. Check API keys.")
         return jsonify({"error": "Bybit client not initialized"}), 500
 
     symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT"]
     market_data = {}
 
     for symbol in symbols:
-        print(f"\n--- Fetching daily kline data for {symbol} ---")
+        app.logger.info(f"\n--- Fetching daily kline data for {symbol} ---")
         try:
             kline_response = bybit_client.get_kline(
-                category="spot",
+                category="spot", # Assuming spot for general market prices. Adjust if using linear/inverse.
                 symbol=symbol,
                 interval="D", # Daily interval for general market overview
                 limit=1000 # Max limit supported by Bybit
@@ -118,178 +130,109 @@ def get_all_market_prices():
                 df = df.iloc[::-1] # Reverse DataFrame to be OLDEST TO NEWEST
 
                 # --- DEBUG: Verify dtypes after conversion ---
-                print(f"\n--- DEBUG: Dashboard {symbol} dtypes after numeric conversion ---")
+                app.logger.info(f"\n--- DEBUG: Dashboard {symbol} dtypes after numeric conversion ---")
                 df.info(verbose=True, buf=sys.stdout) # Use verbose=True to see all dtypes
-                print("------------------------------------------------------------------")
+                app.logger.info("------------------------------------------------------------------")
                 
                 # Check for NaNs immediately after conversion in critical columns
                 if df[numeric_cols].isnull().any().any():
-                    print(f"WARNING: Dashboard {symbol} has NaN values in OHLCV or volume columns after conversion.")
-                    # Optionally, handle rows with NaNs (e.g., drop them)
-                    # df.dropna(subset=numeric_cols, inplace=True)
-
+                    app.logger.warning(f"WARNING: Dashboard {symbol} has NaN values in OHLCV or volume columns after conversion.")
 
                 last_close = df['close'].iloc[-1]
                 prev_close = df['close'].iloc[-2] if len(df) > 1 else last_close
                 percent_change = ((last_close - prev_close) / prev_close) * 100 if prev_close != 0 else 0
 
-                # --- Apply Indicators for Dashboard ---
-                df.ta.rsi(append=True) # Adds 'RSI_14'
-                df.ta.macd(append=True) # Adds 'MACD_12_26_9', 'MACDh_12_26_9', and 'MACDs_12_26_9' (based on your logs)
-                df.ta.stoch(append=True) # Adds 'STOCHk_14_3_3', 'STOCHd_14_3_3'
-                df.ta.atr(append=True) # Adds 'ATR_14', 'ATRr_14'
-
-                # --- NEW DEBUG PRINT: List all columns after pandas_ta ---
-                print(f"\n--- DEBUG: Dashboard {symbol} ALL COLUMNS after pandas_ta: ---")
-                print(df.columns.tolist())
-                print("------------------------------------------------------------------")
-                # --- END NEW DEBUG PRINT ---
-
-                print(f"\n--- DEBUG: Dashboard {symbol} DataFrame info after pandas_ta ---")
-                df.info(verbose=False, buf=sys.stdout)
-                print("------------------------------------------------------------------")
-
-                print(f"\n--- DEBUG: Dashboard {symbol} Tail for Indicators after pandas_ta ---")
-                # Updated to match actual pandas_ta naming if necessary for debug print
-                dashboard_cols = ['RSI_14', 'MACD_12_26_9', 'MACDs_12_26_9', 'STOCHk_14_3_3', 'ATR_14']
-                existing_dashboard_cols = [col for col in dashboard_cols if col in df.columns]
-                if existing_dashboard_cols:
-                    tail_data = df[existing_dashboard_cols].tail(10)
-                    print(tail_data)
-                    if tail_data.iloc[-1].isnull().any():
-                        print(f"WARNING: Dashboard {symbol} Last row of selected indicators contains NaN values.")
-                else:
-                    print(f"No selected indicator columns found for dashboard {symbol} after calculation (this means they were not created or are all NaN).")
-                print("------------------------------------------------------------------")
-
-
-                orscr_signal = "NEUTRAL"
-                rsi_val = get_indicator_value(df, 'RSI_14', default_val="N/A")
-                macd_val = get_indicator_value(df, 'MACD_12_26_9', default_val="N/A")
-                
-                # --- REVISED LOGIC FOR MACD SIGNAL IN DASHBOARD ---
-                # Retrieve all necessary values first
-                macds_val = get_indicator_value(df, 'MACDs_12_26_9', default_val="N/A") # Actual signal line
-                macdh_val = get_indicator_value(df, 'MACDh_12_26_9', default_val="N/A") # Histogram
-
-                # --- FIX: Ensure stoch_k_val is defined ---
-                stoch_k_val = get_indicator_value(df, 'STOCHk_14_3_3', default_val="N/A") # This was missing
-
-                # Condition for MACD (prioritize MACDs, then MACDh)
-                macd_is_bullish = False
-                macd_is_bearish = False
-                if isinstance(macd_val, (int, float)): # Check if MACD main line is numeric
-                    if isinstance(macds_val, (int, float)): # Prefer MACD Signal Line for crossover
-                        if macd_val > macds_val: # Bullish crossover
-                            macd_is_bullish = True
-                            print(f"DEBUG: MACD Signal Line (MACDs) indicates bullish momentum (MACD > MACDs).")
-                        elif macd_val < macds_val: # Bearish crossover
-                            macd_is_bearish = True
-                            print(f"DEBUG: MACD Signal Line (MACDs) indicates bearish momentum (MACD < MACDs).")
-                        else:
-                            print(f"DEBUG: MACD Signal Line (MACDs) not confirming direction.")
-                    elif isinstance(macdh_val, (int, float)): # Fallback to MACD Histogram if MACDs is not available or is N/A
-                        if macdh_val > 0: # Bullish: Histogram above 0
-                            macd_is_bullish = True
-                            print(f"DEBUG: MACD Histogram (MACDh) indicates bullish momentum (MACDs not available).")
-                        elif macdh_val < 0: # Bearish: Histogram below 0
-                            macd_is_bearish = True
-                            print(f"DEBUG: MACD Histogram (MACDh) indicates bearish momentum (MACDs not available).")
-                        else:
-                            print(f"DEBUG: MACD Histogram (MACDh) not confirming direction (MACDs not available).")
-                    else:
-                        print(f"DEBUG: Neither MACDs nor MACDh values are numeric, MACD condition skipped.")
-                else:
-                    print(f"DEBUG: MACD_12_26_9 value is not numeric, skipping MACD condition.")
-
-
-                # Final ORSCR signal determination for dashboard - simplified to not use overall_bias
-                if isinstance(rsi_val, (int, float)):
-                    if rsi_val > 60 and macd_is_bullish:
-                        orscr_signal = "BUY"
-                    elif rsi_val < 40 and macd_is_bearish:
-                        orscr_signal = "SELL"
-                    else:
-                         orscr_signal = "NEUTRAL"
-                else:
-                    orscr_signal = "N/A (Indicators not available for ORSCR logic or not confirming)"
-
+                # --- REMOVED PANDAS_TA CALLS from get_all_market_prices ---
+                # These lines previously used df.ta.rsi, df.ta.macd, etc.
+                # Since pandas_ta is not installed, these calls are removed.
+                # Indicator values will now be "N/A" by default.
+                rsi_val = "N/A"
+                macd_val = "N/A"
+                stoch_k_val = "N/A"
+                orscr_signal = "N/A" # Default signal
 
                 market_data[symbol] = {
                     "price": round(float(last_close), 2),
                     "percent_change": round(float(percent_change), 2),
                     "rsi": rsi_val,
                     "macd": macd_val,
-                    "stoch_k": stoch_k_val, # Now correctly defined
+                    "stoch_k": stoch_k_val, # Now correctly defined, defaulting to N/A
                     "volume": round(float(df['volume'].iloc[-1]), 2),
-                    "orscr_signal": orscr_signal
+                    "orscr_signal": orscr_signal # Will be N/A for now
                 }
-                print(f"Final market_data[{symbol}]: {market_data[symbol]}")
+                app.logger.info(f"Final market_data[{symbol}]: {market_data[symbol]}")
             else:
-                print(f"Insufficient kline data for {symbol} to calculate full market details.")
+                app.logger.warning(f"No kline data or error for {symbol} from Bybit: {kline_response.get('retMsg', 'Unknown error')}")
                 market_data[symbol] = {
                     "price": "N/A", "percent_change": "N/A", "rsi": "N/A",
                     "macd": "N/A", "stoch_k": "N/A", "volume": "N/A", "orscr_signal": "N/A"
                 }
 
         except Exception as e:
-            print(f"Error fetching or processing data for {symbol}: {e}")
+            app.logger.error(f"Error fetching or processing data for {symbol} from Bybit: {e}")
             traceback.print_exc()
             market_data[symbol] = {
                 "price": "N/A", "percent_change": "N/A", "rsi": "N/A",
                 "macd": "N/A", "stoch_k": "N/A", "volume": "N/A", "orscr_signal": "N/A"
             }
         
-        time.sleep(0.5)
+        time.sleep(0.5) # Small delay to avoid hitting Bybit API rate limits
+
+    # Update cache
+    globals()['last_market_data'] = market_data
+    globals()['last_fetch_time'] = time.time()
 
     return jsonify(market_data)
 
 # --- Chat Endpoint (Existing) ---
 @app.route('/chat', methods=['POST'])
 def chat():
+    # Access global gemini_model
+    global gemini_model 
     if not gemini_model:
+        app.logger.error("Gemini model not initialized for chat endpoint.")
         return jsonify({"error": "Gemini model not initialized"}), 500
 
-    user_message_data = request.json.get('message')
-    # The frontend is expected to send the entire chat history in `message` under a `parts` key
-    # For now, we assume user_message_data is the full history if it's a list, otherwise just the last message
-    
-    # Original logic was expecting a simple string, but the prompt now expects a structured history.
-    # We will adjust to correctly send the full history from frontend, so backend receives correct structure.
-    chat_history_from_frontend = request.json.get('chatHistory', [])
-    latest_user_message = user_message_data # Assuming message still carries the last user input directly if chatHistory is provided separately
+    data = request.json
+    user_message_data = data.get('message')
+    user_name = data.get('userName', 'Trader')
+    ai_name = data.get('aiName', 'Aura')
 
-    # Construct the full chat history for Gemini including prior turns
+    if not user_message_data:
+        return jsonify({"error": "No message provided"}), 400
+
+    chat_history_from_frontend = data.get('chatHistory', [])
+    latest_user_message = user_message_data
+
     gemini_chat_history = []
     for chat_turn in chat_history_from_frontend:
         gemini_chat_history.append({'role': chat_turn['role'], 'parts': [{'text': chat_turn['text']}]})
 
-    # Add the current user message (which should be the last one in the chat_history_from_frontend)
-    # Or if frontend sends only the new message as 'message' field
-    if not chat_history_from_frontend and latest_user_message: # If frontend sends only latest message, treat it as single turn
-         gemini_chat_history.append({'role': 'user', 'parts': [{'text': latest_user_message}]})
-    elif chat_history_from_frontend and latest_user_message: # If frontend sends full history, last part is the latest user message
-        # Ensure the last message in gemini_chat_history is indeed the latest user message
+    if not chat_history_from_frontend and latest_user_message:
+        gemini_chat_history.append({'role': 'user', 'parts': [{'text': latest_user_message}]})
+    elif chat_history_from_frontend and latest_user_message:
         if gemini_chat_history and gemini_chat_history[-1]['role'] == 'user' and gemini_chat_history[-1]['parts'][0]['text'] == latest_user_message:
-            pass # Already correctly added by iterating chat_history_from_frontend
+            pass
         else:
-             gemini_chat_history.append({'role': 'user', 'parts': [{'text': latest_user_message}]})
-
+            gemini_chat_history.append({'role': 'user', 'parts': [{'text': latest_user_message}]})
 
     # Fetch live market data for context
     market_data_response = get_all_market_prices()
-    market_data = market_data_response.json
+    # Check if get_all_market_prices returned an error (it can return 500 now)
+    if isinstance(market_data_response, tuple) and market_data_response[1] != 200:
+        app.logger.error(f"Failed to get market data for chat context: {market_data_response[0].json.get('error', 'Unknown error')}")
+        market_data = {} # Fallback to empty data
+    else:
+        market_data = market_data_response.json
+
 
     # Trade history will now be managed on frontend, so we don't fetch it from local file
-    # For now, provide empty trade history, or fetch from a mock source if needed for LLM context,
-    # but the frontend will be responsible for displaying its own persistent trade history.
-    mock_trade_history = [] # Frontend handles persistence. Backend won't know trade history unless explicitly sent.
+    mock_trade_history = [] 
 
-    # Construct overall context for Gemini
     context_prefix = f"""
     You are Aura, an AI trading assistant. Your goal is to provide insightful, helpful, and **friendly** responses to the user's trading-related questions.
     Adopt a **conversational, approachable, and encouraging tone**. Avoid overly formal or robotic language.
-    You can use emojis if appropriate to convey friendliness (e.g., 👋😊).
+    You can use emojis if appropriate to convey friendliness (e.g., 🚀🌟).
 
     Here is the current live market data:
     {json.dumps(market_data, indent=2)}
@@ -297,48 +240,46 @@ def chat():
     (Note: Trade history is now managed by the user on the frontend, so it's not provided in real-time here for chat context.)
     """
 
-    # Prepend context to the first user message, or handle as a system instruction
-    # For Gemini API, best practice is to structure as alternating roles.
-    # The first message from the user often acts as the initial prompt/context.
     if gemini_chat_history:
-        # If there's already a conversation, add system instruction at the start of the first user turn.
-        # This approach ensures the context is always present without being a separate AI turn.
         if gemini_chat_history[0]['role'] == 'user':
             gemini_chat_history[0]['parts'][0]['text'] = context_prefix + "\n" + gemini_chat_history[0]['parts'][0]['text']
-        else: # If conversation starts with model, something is off, but prepend to first user turn when it appears
-             found_user_turn = False
-             for turn in gemini_chat_history:
-                 if turn['role'] == 'user':
-                     turn['parts'][0]['text'] = context_prefix + "\n" + turn['parts'][0]['text']
-                     found_user_turn = True
-                     break
-             if not found_user_turn: # Fallback if only AI messages in history
-                 gemini_chat_history = [{'role': 'user', 'parts': [{'text': context_prefix + "\n" + latest_user_message}]}] + gemini_chat_history
-    else: # If it's a brand new conversation
+        else: 
+            found_user_turn = False
+            for turn in gemini_chat_history:
+                if turn['role'] == 'user':
+                    turn['parts'][0]['text'] = context_prefix + "\n" + turn['parts'][0]['text']
+                    found_user_turn = True
+                    break
+            if not found_user_turn:
+                gemini_chat_history = [{'role': 'user', 'parts': [{'text': context_prefix + "\n" + latest_user_message}]}] + gemini_chat_history
+    else:
         gemini_chat_history.append({'role': 'user', 'parts': [{'text': context_prefix + "\n" + latest_user_message}]})
 
-
     try:
-        # Debugging the chat history sent to Gemini
-        print("\n--- DEBUG: Chat history sent to Gemini API ---")
+        app.logger.info("\n--- DEBUG: Chat history sent to Gemini API ---")
         for entry in gemini_chat_history:
-            print(f"Role: {entry['role']}, Text: {entry['parts'][0]['text'][:200]}...") # Print first 200 chars
-        print("----------------------------------------------")
+            app.logger.info(f"Role: {entry['role']}, Text: {entry['parts'][0]['text'][:200]}...")
+        app.logger.info("----------------------------------------------")
 
         response = gemini_model.generate_content(gemini_chat_history)
         ai_response = response.candidates[0].content.parts[0].text
         return jsonify({"response": ai_response})
     except Exception as e:
-        print(f"Error generating content with Gemini: {e}")
+        app.logger.error(f"Error generating content with Gemini: {e}")
         traceback.print_exc()
         return jsonify({"error": f"Failed to get AI response: {e}"}), 500
 
-# --- Removed Trade Log Endpoints (now handled by frontend Firestore) ---
-# TRADE_LOG_FILE = 'trades.json'
-# def load_trades(): ...
-# def save_trades(trades): ...
+# --- Removed Trade Log Endpoints (now handled by frontend Firestore, or can be re-added if needed for backend storage) ---
+# TRADES_FILE = 'trades.json' # These were for local JSON storage
+# ANALYSIS_FILE = 'analysis_results.json' # These were for local JSON storage
+# def init_db(): ... # No longer needed if moving to Firestore
+# def read_trades(): ...
+# def write_trades(trades): ...
+# def read_analysis_results(): ...
+# def write_analysis_results(results): ...
 # @app.route('/log_trade', methods=['POST']) ...
 # @app.route('/get_trades', methods=['GET']) ...
+# @app.route('/get_trade_summary', methods=['GET']) ...
 
 
 # --- ORMCR Analysis Endpoint ---
@@ -357,7 +298,7 @@ BYBIT_INTERVAL_MAP = {
 def fetch_real_ohlcv(symbol, interval_key):
     """Fetches real OHLCV data from Bybit for a given symbol and interval."""
     if not bybit_client:
-        print("Bybit client not initialized. Cannot fetch real data.")
+        app.logger.error("Bybit client not initialized. Cannot fetch real data for ORMCR.")
         return pd.DataFrame()
 
     bybit_interval = BYBIT_INTERVAL_MAP[interval_key]["interval"]
@@ -365,7 +306,7 @@ def fetch_real_ohlcv(symbol, interval_key):
 
     try:
         kline_response = bybit_client.get_kline(
-            category="spot",
+            category="spot", # Assuming spot. Adjust if using linear/inverse for ORMCR.
             symbol=symbol,
             interval=bybit_interval,
             limit=limit
@@ -373,7 +314,7 @@ def fetch_real_ohlcv(symbol, interval_key):
         kline_data = kline_response.get('result', {}).get('list', [])
 
         if not kline_data:
-            print(f"No kline data found for {symbol} on {interval_key} interval.")
+            app.logger.warning(f"No kline data found for {symbol} on {interval_key} interval.")
             return pd.DataFrame()
 
         df = pd.DataFrame(kline_data, columns=['start', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
@@ -381,72 +322,89 @@ def fetch_real_ohlcv(symbol, interval_key):
         # --- CRITICAL FIX: Ensure all OHLCV and volume columns are numeric ---
         numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'turnover']
         for col in numeric_cols:
-            df[col] = pd.to_numeric(df[col], errors='coerce') # Convert non-numeric to NaN
+            df[col] = pd.to_numeric(df[col], errors='coerce')
 
         df['start'] = pd.to_numeric(df['start'])
         df['start'] = pd.to_datetime(df['start'], unit='ms')
         df.set_index('start', inplace=True)
-        df = df.iloc[::-1]
+        df = df.iloc[::-1] # Reverse to be OLDEST TO NEWEST
 
         # --- DEBUG: Verify dtypes after conversion in fetch_real_ohlcv ---
-        print(f"\n--- DEBUG: fetch_real_ohlcv for {symbol} ({interval_key}) dtypes after numeric conversion ---")
-        df.info(verbose=True, buf=sys.stdout) # Use verbose=True to see all dtypes
-        print("------------------------------------------------------------------")
+        app.logger.info(f"\n--- DEBUG: fetch_real_ohlcv for {symbol} ({interval_key}) dtypes after numeric conversion ---")
+        df.info(verbose=True, buf=sys.stdout)
+        app.logger.info("------------------------------------------------------------------")
 
         if df[numeric_cols].isnull().any().any():
-            print(f"WARNING: fetch_real_ohlcv for {symbol} ({interval_key}) has NaN values in OHLCV or volume columns after conversion.")
+            app.logger.warning(f"WARNING: fetch_real_ohlcv for {symbol} ({interval_key}) has NaN values in OHLCV or volume columns after conversion.")
 
         return df
 
     except Exception as e:
-        print(f"Error fetching real OHLCV data for {symbol} ({interval_key}): {e}")
+        app.logger.error(f"Error fetching real OHLCV data for {symbol} ({interval_key}): {e}")
         traceback.print_exc()
         return pd.DataFrame()
 
 
 def calculate_indicators_for_df(df, indicators):
-    """Calculates selected indicators for a DataFrame."""
+    """
+    Calculates selected indicators for a DataFrame.
+    NOTE: Removed .ta calls as pandas_ta is not installed.
+    Indicators will currently not be calculated via pandas_ta.
+    """
     df_copy = df.copy()
     
-    if "RSI" in indicators:
-        df_copy.ta.rsi(append=True)
-    if "MACD" in indicators:
-        df_copy.ta.macd(append=True) # This will create MACD_12_26_9, MACDh_12_26_9, and MACDs_12_26_9
-    if "Moving Averages" in indicators:
-        df_copy.ta.ema(length=9, append=True)
-        df_copy.ta.sma(length=20, append=True)
-        df_copy.ta.ema(length=50, append=True)
-    if "Bollinger Bands" in indicators:
-        df_copy.ta.bbands(append=True)
-    if "Stochastic Oscillator" in indicators:
-        df_copy.ta.stoch(append=True)
-    if "Volume" in indicators:
-        df_copy['volume'] = pd.to_numeric(df_copy['volume'])
-    if "ATR" in indicators:
-        df_copy.ta.atr(append=True)
+    # --- REMOVED PANDAS_TA CALLS from calculate_indicators_for_df ---
+    # These functions would normally call df_copy.ta.rsi(), etc.
+    # Since pandas_ta is not installed, these calls are removed.
+    # If you want to re-introduce indicator calculations without pandas_ta,
+    # you would add custom logic here or integrate a different library.
 
-    # --- NEW DEBUG PRINT: List all columns after pandas_ta ---
-    print(f"\n--- DEBUG: ORMCR Analysis ALL COLUMNS after pandas_ta: ---")
-    print(df_copy.columns.tolist())
-    print("------------------------------------------------------------------")
-    # --- END NEW DEBUG PRINT ---
+    # if "RSI" in indicators:
+    #     df_copy.ta.rsi(append=True)
+    # if "MACD" in indicators:
+    #     df_copy.ta.macd(append=True)
+    # if "Moving Averages" in indicators:
+    #     df_copy.ta.ema(length=9, append=True)
+    #     df_copy.ta.sma(length=20, append=True)
+    #     df_copy.ta.ema(length=50, append=True)
+    # if "Bollinger Bands" in indicators:
+    #     df_copy.ta.bbands(append=True)
+    # if "Stochastic Oscillator" in indicators:
+    #     df_copy.ta.stoch(append=True)
+    # if "ATR" in indicators:
+    #     df_copy.ta.atr(append=True)
 
-    print(f"\n--- DEBUG: ORMCR Analysis DataFrame info after pandas_ta for columns: {df_copy.columns.tolist()} ---")
+    # For now, ensure these columns exist even if empty/NaN to avoid KeyError later in get_indicator_value
+    placeholder_cols = [
+        'RSI_14', 'MACD_12_26_9', 'MACDh_12_26_9', 'MACDs_12_26_9', 
+        'EMA_9', 'SMA_20', 'EMA_50',
+        'BBL_5_2.0', 'BBM_5_2.0', 'BBU_5_2.0', 'BBB_5_2.0', 'BBP_5_2.0',
+        'STOCHk_14_3_3', 'STOCHd_14_3_3',
+        'ATR_14', 'ATRr_14'
+    ]
+    for col in placeholder_cols:
+        if col not in df_copy.columns:
+            df_copy[col] = np.nan # Add as NaN if not already present from Bybit data (e.g., 'volume')
+
+    app.logger.info(f"\n--- DEBUG: ORMCR Analysis ALL COLUMNS after (no) pandas_ta: ---")
+    app.logger.info(df_copy.columns.tolist())
+    app.logger.info("------------------------------------------------------------------")
+
+    app.logger.info(f"\n--- DEBUG: ORMCR Analysis DataFrame info after (no) pandas_ta for columns: {df_copy.columns.tolist()} ---")
     df_copy.info(verbose=False, buf=sys.stdout)
-    print("------------------------------------------------------------------")
+    app.logger.info("------------------------------------------------------------------")
 
-    print("\n--- DEBUG: ORMCR Analysis DataFrame Tail for Critical Indicators after pandas_ta calculation ---")
-    # Updated to match actual pandas_ta naming
+    app.logger.info("\n--- DEBUG: ORMCR Analysis DataFrame Tail for Critical Indicators after (no) pandas_ta calculation ---")
     selected_cols = ['MACD_12_26_9', 'MACDs_12_26_9', 'MACDh_12_26_9', 'ATR_14', 'RSI_14', 'STOCHk_14_3_3', 'EMA_9']
     existing_cols = [col for col in selected_cols if col in df_copy.columns]
     if existing_cols:
         tail_data = df_copy[existing_cols].tail(20)
-        print(tail_data)
-        if tail_data.iloc[-1].isnull().any().any(): # Check if any selected indicator in the last row is NaN
-            print("WARNING: ORMCR Analysis Last row of selected indicators contains NaN values.")
+        app.logger.info(tail_data)
+        if tail_data.iloc[-1].isnull().any().any():
+            app.logger.warning("WARNING: ORMCR Analysis Last row of selected indicators contains NaN values.")
     else:
-        print("No selected indicator columns found in ORMCR Analysis DataFrame after calculation (this means they were not created or are all NaN).")
-    print("------------------------------------------------------------------")
+        app.logger.info("No selected indicator columns found in ORMCR Analysis DataFrame after (no) calculation.")
+    app.logger.info("------------------------------------------------------------------")
 
     return df_copy
 
@@ -454,10 +412,11 @@ def apply_ormcr_logic(analysis_data, selected_indicators_from_frontend):
     """
     Applies ORMCR logic to the analysis data, dynamically considering selected indicators
     and handling N/A values more gracefully for confidence score calculation.
+    NOTE: Indicator values from df will be N/A since pandas_ta is not used.
+    The logic will primarily rely on price action and 'N/A' for indicators.
     """
     overall_bias = "NEUTRAL"
     confirmation_status = "PENDING"
-    # Initial confirmation reason will be replaced if specific conditions are met
     confirmation_reason = "Initial analysis." 
     entry_suggestion = "MONITOR"
     sl_price = "N/A"
@@ -472,45 +431,40 @@ def apply_ormcr_logic(analysis_data, selected_indicators_from_frontend):
     calculated_confidence_score = 0
     calculated_signal_strength = "NEUTRAL"
 
-    # Sort timeframes from highest to lowest (e.g., D1, H4, H1, M30, M15, M5, M1)
-    # This ensures overall_bias is determined by the highest available timeframe first
     sorted_timeframes = sorted(analysis_data.keys(), key=lambda x: int(BYBIT_INTERVAL_MAP.get(x, {"interval": "0"}).get("interval")) if BYBIT_INTERVAL_MAP[x]["interval"].isdigit() else 999999, reverse=True)
     
-    # Ensure smallest timeframe is available for ORMCR lowest TF specific logic
     lowest_tf_key_for_calc = sorted_timeframes[-1] if sorted_timeframes else None
 
-    print(f"\n--- Starting ORMCR Logic ---")
-    print(f"Sorted Timeframes: {sorted_timeframes}")
-    print(f"Lowest Timeframe for Calc: {lowest_tf_key_for_calc}")
-    print(f"Selected Indicators from Frontend: {selected_indicators_from_frontend}")
+    app.logger.info(f"\n--- Starting ORMCR Logic ---")
+    app.logger.info(f"Sorted Timeframes: {sorted_timeframes}")
+    app.logger.info(f"Lowest Timeframe for Calc: {lowest_tf_key_for_calc}")
+    app.logger.info(f"Selected Indicators from Frontend: {selected_indicators_from_frontend}")
 
     trend_analysis = {}
     for tf in sorted_timeframes:
         df = analysis_data[tf]['df']
-        # Need at least 2 candles for trend comparison for EMA9 logic
         if df.empty or len(df) < 2: 
             trend_analysis[tf] = {"trend": "No sufficient data", "last_close": "N/A", "ema9": "N/A", "rsi": "N/A", "macd_hist": "N/A"}
-            print(f"  {tf}: No sufficient data for trend analysis.")
+            app.logger.info(f"  {tf}: No sufficient data for trend analysis.")
             continue
 
         last_close = get_indicator_value(df, 'close')
-        ema9 = get_indicator_value(df, 'EMA_9')
-        rsi = get_indicator_value(df, 'RSI_14')
-        macd_hist = get_indicator_value(df, 'MACDh_12_26_9') # Use MACDh as that's what pandas_ta provides
+        ema9 = get_indicator_value(df, 'EMA_9') # Will be N/A
+        rsi = get_indicator_value(df, 'RSI_14') # Will be N/A
+        macd_hist = get_indicator_value(df, 'MACDh_12_26_9') # Will be N/A
 
         tf_trend = "Neutral"
-        # Trend based on Price vs EMA9 and previous candle vs EMA9
+        # Trend logic will primarily result in Neutral if indicators are N/A
         if "Moving Averages" in selected_indicators_from_frontend and isinstance(ema9, (int, float)) and isinstance(last_close, (int, float)) and 'EMA_9' in df.columns:
-            # Check previous EMA9 and close for trend confirmation
             if len(df) > 1 and not pd.isna(df['EMA_9'].iloc[-2]) and not pd.isna(df['close'].iloc[-2]):
                 prev_ema9 = df['EMA_9'].iloc[-2]
                 prev_close = df['close'].iloc[-2]
 
-                if last_close > ema9 and prev_close > prev_ema9: # Both current and previous close above EMA9
+                if last_close > ema9 and prev_close > prev_ema9:
                     tf_trend = "Uptrend"
-                elif last_close < ema9 and prev_close < prev_ema9: # Both current and previous close below EMA9
+                elif last_close < ema9 and prev_close < prev_ema9:
                     tf_trend = "Downtrend"
-            elif last_close > ema9: # If only one candle or prev is NaN, judge by current position relative to EMA9
+            elif last_close > ema9:
                 tf_trend = "Uptrend (weak)"
             elif last_close < ema9:
                 tf_trend = "Downtrend (weak)"
@@ -524,32 +478,27 @@ def apply_ormcr_logic(analysis_data, selected_indicators_from_frontend):
             "rsi": rsi,
             "macd_hist": macd_hist
         }
-        print(f"  {tf} Trend Analysis: {trend_analysis[tf]}")
+        app.logger.info(f"  {tf} Trend Analysis: {trend_analysis[tf]}")
     
-    # Determine overall_bias from highest available timeframe with a determined trend
-    for tf_key in ["D1", "H4", "H1", "M30", "M15", "M5", "M1"]: # Ordered from highest to lowest
+    for tf_key in ["D1", "H4", "H1", "M30", "M15", "M5", "M1"]:
         if tf_key in trend_analysis and trend_analysis[tf_key]["trend"] not in ["Neutral", "No sufficient data", "Uptrend (weak)", "Downtrend (weak)", "Neutral (EMA9 data not available or not selected)"]:
             overall_bias = trend_analysis[tf_key]["trend"].upper()
-            print(f"  Overall Bias determined from {tf_key}: {overall_bias}")
+            app.logger.info(f"  Overall Bias determined from {tf_key}: {overall_bias}")
             break
-    print(f"Final Overall Bias: {overall_bias}")
+    app.logger.info(f"Final Overall Bias: {overall_bias}")
 
-    confirmation_details = [] # This list will collect all specific details for confirmation reason
+    confirmation_details = []
     
-    # --- Start of Lowest Timeframe Specific Logic for Confidence Score ---
     if lowest_tf_key_for_calc and lowest_tf_key_for_calc in analysis_data and not analysis_data[lowest_tf_key_for_calc]['df'].empty:
         df_lowest = analysis_data[lowest_tf_key_for_calc]['df']
         
-        # Ensure sufficient data points for lowest_tf for detailed analysis
         if len(df_lowest) < 2:
             confirmation_reason = f"Not enough historical data ({len(df_lowest)} candles) for lowest timeframe ({lowest_tf_key_for_calc}) for detailed confirmation. At least 2 candles are needed."
-            calculated_confidence_score = 30 # Default low confidence
+            calculated_confidence_score = 30
             calculated_signal_strength = "NEUTRAL"
             entry_suggestion = "MONITOR"
             confirmation_status = "PENDING"
-            print(f"  Confirmation Reason: {confirmation_reason}")
-            # Skip detailed indicator checks and signal determination, use default pending
-            # Return immediately with basic values if data is insufficient
+            app.logger.info(f"  Confirmation Reason: {confirmation_reason}")
             return {
                 "overall_bias": overall_bias,
                 "confirmation_status": confirmation_status,
@@ -568,31 +517,30 @@ def apply_ormcr_logic(analysis_data, selected_indicators_from_frontend):
         last_close_lowest = get_indicator_value(df_lowest, 'close')
         prev_close_lowest = df_lowest['close'].iloc[-2] if len(df_lowest) > 1 and not pd.isna(df_lowest['close'].iloc[-2]) else np.nan
 
-        ema9_lowest = get_indicator_value(df_lowest, 'EMA_9')
-        rsi_lowest = get_indicator_value(df_lowest, 'RSI_14')
-        macd_lowest = get_indicator_value(df_lowest, 'MACD_12_26_9')
-        macds_lowest = get_indicator_value(df_lowest, 'MACDs_12_26_9') # Actual signal line
-        macdh_lowest = get_indicator_value(df_lowest, 'MACDh_12_26_9') # Histogram
-        stoch_k_lowest = get_indicator_value(df_lowest, 'STOCHk_14_3_3')
-        stoch_d_lowest = get_indicator_value(df_lowest, 'STOCHd_14_3_3')
-        atr_lowest = get_indicator_value(df_lowest, 'ATR_14')
+        ema9_lowest = get_indicator_value(df_lowest, 'EMA_9') # N/A
+        rsi_lowest = get_indicator_value(df_lowest, 'RSI_14') # N/A
+        macd_lowest = get_indicator_value(df_lowest, 'MACD_12_26_9') # N/A
+        macds_lowest = get_indicator_value(df_lowest, 'MACDs_12_26_9') # N/A
+        macdh_lowest = get_indicator_value(df_lowest, 'MACDh_12_26_9') # N/A
+        stoch_k_lowest = get_indicator_value(df_lowest, 'STOCHk_14_3_3') # N/A
+        stoch_d_lowest = get_indicator_value(df_lowest, 'STOCHd_14_3_3') # N/A
+        atr_lowest = get_indicator_value(df_lowest, 'ATR_14') # N/A
 
-        print(f"  Lowest TF ({lowest_tf_key_for_calc}) Indicator Values:")
-        print(f"    Last Close: {last_close_lowest}, Prev Close: {prev_close_lowest}")
-        print(f"    EMA9: {ema9_lowest}, RSI: {rsi_lowest}")
-        print(f"    MACD: {macd_lowest}, MACDS: {macds_lowest}, MACDH: {macdh_lowest}, STOCH_K: {stoch_k_lowest}, STOCH_D: {stoch_d_lowest}, ATR: {atr_lowest}")
+        app.logger.info(f"  Lowest TF ({lowest_tf_key_for_calc}) Indicator Values:")
+        app.logger.info(f"    Last Close: {last_close_lowest}, Prev Close: {prev_close_lowest}")
+        app.logger.info(f"    EMA9: {ema9_lowest}, RSI: {rsi_lowest}")
+        app.logger.info(f"    MACD: {macd_lowest}, MACDS: {macds_lowest}, MACDH: {macdh_lowest}, STOCH_K: {stoch_k_lowest}, STOCH_D: {stoch_d_lowest}, ATR: {atr_lowest}")
 
         directional_signals_count = 0
-        total_relevant_indicators = 0 # Only counts indicators selected AND for which data is available
-
+        total_relevant_indicators = 0 
 
         # Condition 1: Price Action (Strong Candle)
         if isinstance(last_close_lowest, (int, float)) and isinstance(prev_close_lowest, (int, float)):
             total_relevant_indicators += 1
-            if last_close_lowest > prev_close_lowest * 1.001: # 0.1% increase suggests strong bullish momentum
+            if last_close_lowest > prev_close_lowest * 1.001:
                 directional_signals_count += 1
                 confirmation_details.append("Price action: Strong bullish candle detected.")
-            elif last_close_lowest < prev_close_lowest * 0.999: # 0.1% decrease suggests strong bearish momentum
+            elif last_close_lowest < prev_close_lowest * 0.999:
                 directional_signals_count += 1
                 confirmation_details.append("Price action: Strong bearish candle detected.")
             else:
@@ -601,7 +549,12 @@ def apply_ormcr_logic(analysis_data, selected_indicators_from_frontend):
             confirmation_details.append("Price action: Data missing or invalid for candle analysis.")
 
 
-        # Condition 2: Price vs. EMA9 - only if Moving Averages is selected and EMA_9 is available
+        # Conditions 2-6 (EMA9, RSI, MACD, Stochastic, Bollinger Bands) will be N/A due to pandas_ta removal.
+        # The logic here will mainly default to 'Data missing or not selected'
+        # or rely on the `isinstance` checks returning False for non-numeric 'N/A' values.
+        # This will reduce `directional_signals_count` if these indicators were selected.
+
+        # Condition 2: Price vs. EMA9
         if "Moving Averages" in selected_indicators_from_frontend and isinstance(ema9_lowest, (int, float)) and isinstance(last_close_lowest, (int, float)):
             total_relevant_indicators += 1
             if last_close_lowest > ema9_lowest:
@@ -612,17 +565,17 @@ def apply_ormcr_logic(analysis_data, selected_indicators_from_frontend):
                 confirmation_details.append("EMA9: Price below EMA9 (bearish alignment).")
             else:
                 confirmation_details.append("EMA9: Price is neutral around EMA9.")
-        elif "Moving Averages" in selected_indicators_from_frontend: # Indicator was selected but data not available/valid
+        elif "Moving Averages" in selected_indicators_from_frontend:
             confirmation_details.append("EMA9: Data missing or not selected.")
 
 
-        # Condition 3: RSI - only if RSI is selected and RSI is available
+        # Condition 3: RSI
         if "RSI" in selected_indicators_from_frontend and isinstance(rsi_lowest, (int, float)):
             total_relevant_indicators += 1
-            if rsi_lowest > 60: # Overbought (strong buying pressure)
+            if rsi_lowest > 60:
                 directional_signals_count += 1
                 confirmation_details.append("RSI: Overbought (>60), indicating strong recent buying pressure.")
-            elif rsi_lowest < 40: # Oversold (strong selling pressure)
+            elif rsi_lowest < 40:
                 directional_signals_count += 1
                 confirmation_details.append("RSI: Oversold (<40), indicating strong recent selling pressure.")
             else:
@@ -631,10 +584,10 @@ def apply_ormcr_logic(analysis_data, selected_indicators_from_frontend):
             confirmation_details.append("RSI: Data missing or not selected.")
 
 
-        # Condition 4: MACD Crossover / Momentum - only if MACD is selected
+        # Condition 4: MACD Crossover / Momentum
         if "MACD" in selected_indicators_from_frontend and isinstance(macd_lowest, (int, float)):
             total_relevant_indicators += 1
-            if isinstance(macds_lowest, (int, float)): # Prefer MACD signal line for crossover
+            if isinstance(macds_lowest, (int, float)):
                 if macd_lowest > macds_lowest:
                     directional_signals_count += 1
                     confirmation_details.append("MACD: Bullish crossover (MACD line > Signal line).")
@@ -643,7 +596,7 @@ def apply_ormcr_logic(analysis_data, selected_indicators_from_frontend):
                     confirmation_details.append("MACD: Bearish crossover (MACD line < Signal line).")
                 else:
                     confirmation_details.append("MACD: No clear crossover signal.")
-            elif isinstance(macdh_lowest, (int, float)): # Fallback to MACD Histogram if MACDs is not found or is N/A
+            elif isinstance(macdh_lowest, (int, float)):
                 if macdh_lowest > 0:
                     directional_signals_count += 1
                     confirmation_details.append("MACD: Histogram bullish (>0).")
@@ -658,15 +611,13 @@ def apply_ormcr_logic(analysis_data, selected_indicators_from_frontend):
             confirmation_details.append("MACD: Data missing or not selected.")
 
 
-        # Condition 5: Stochastic Oscillator (Crossover / Not Overbought/Oversold extremes) - only if Stochastic is selected
+        # Condition 5: Stochastic Oscillator
         if "Stochastic Oscillator" in selected_indicators_from_frontend and \
            isinstance(stoch_k_lowest, (int, float)) and isinstance(stoch_d_lowest, (int, float)):
             total_relevant_indicators += 1
-            # Bullish crossover (K above D) and not overbought (below 80)
             if stoch_k_lowest > stoch_d_lowest and stoch_k_lowest < 80: 
                 directional_signals_count += 1
                 confirmation_details.append("Stochastic: Bullish crossover (K above D), not overbought.")
-            # Bearish crossover (K below D) and not oversold (above 20)
             elif stoch_k_lowest < stoch_d_lowest and stoch_k_lowest > 20: 
                 directional_signals_count += 1
                 confirmation_details.append("Stochastic: Bearish crossover (K below D), not oversold.")
@@ -680,13 +631,12 @@ def apply_ormcr_logic(analysis_data, selected_indicators_from_frontend):
         elif "Stochastic Oscillator" in selected_indicators_from_frontend:
             confirmation_details.append("Stochastic: Data missing or not selected.")
 
-        # Condition 6: Bollinger Bands - only if Bollinger Bands is selected
+        # Condition 6: Bollinger Bands
         if "Bollinger Bands" in selected_indicators_from_frontend:
             bb_upper = get_indicator_value(df_lowest, 'BBU_5_2.0')
             bb_lower = get_indicator_value(df_lowest, 'BBL_5_2.0')
             if isinstance(bb_upper, (int, float)) and isinstance(bb_lower, (int, float)) and isinstance(last_close_lowest, (int, float)):
                 total_relevant_indicators += 1
-                # Price breaking upper band (bullish) or lower band (bearish)
                 if last_close_lowest > bb_upper:
                     directional_signals_count += 1
                     confirmation_details.append("Bollinger Bands: Price broke above Upper Band (strong bullish move).")
@@ -698,20 +648,16 @@ def apply_ormcr_logic(analysis_data, selected_indicators_from_frontend):
             else:
                 confirmation_details.append("Bollinger Bands: Data missing or not selected.")
 
-        # Condition 7: Volume - only if Volume is selected
+        # Condition 7: Volume - from raw data, but logic here assumes indicator usage
         if "Volume" in selected_indicators_from_frontend:
             volume_val = get_indicator_value(df_lowest, 'volume')
             if isinstance(volume_val, (int, float)) and volume_val > 0:
-                # Compare to average volume or previous candle's volume
-                # For simplicity, let's just check if it's high relative to recent average (mocked or actual calc)
-                # Actual implementation would compare to SMA of volume or look for spikes.
-                # For now, let's just count it as a signal if it's above a simple average (e.g., last 5 candles)
                 if len(df_lowest) >= 5 and 'volume' in df_lowest.columns:
                     recent_avg_volume = df_lowest['volume'].iloc[-5:-1].mean()
-                    if volume_val > recent_avg_volume * 1.5: # 50% above recent average
+                    if volume_val > recent_avg_volume * 1.5:
                         directional_signals_count += 1
                         confirmation_details.append(f"Volume: Significant increase ({volume_val} > 1.5x average).")
-                    elif volume_val < recent_avg_volume * 0.5: # 50% below recent average
+                    elif volume_val < recent_avg_volume * 0.5:
                         directional_signals_count += 1
                         confirmation_details.append(f"Volume: Significant decrease ({volume_val} < 0.5x average).")
                     else:
@@ -723,21 +669,18 @@ def apply_ormcr_logic(analysis_data, selected_indicators_from_frontend):
         elif "Volume" in selected_indicators_from_frontend:
             confirmation_details.append("Volume: Indicator not selected or data not available.")
         
-        # Calculate confidence score based on number of directional signals
         if total_relevant_indicators > 0:
             calculated_confidence_score = int((directional_signals_count / total_relevant_indicators) * 100)
         else:
-            calculated_confidence_score = 30 # Default to a lower score if no relevant indicators were checked
+            calculated_confidence_score = 30
             confirmation_details.append("No relevant ORMCR indicators available or selected for lowest timeframe confirmation, defaulting confidence to 30%.")
 
-        print(f"  Directional Signals Count: {directional_signals_count}")
-        print(f"  Total Relevant Indicators: {total_relevant_indicators}")
-        print(f"  Calculated Confidence Score (based on directional signals): {calculated_confidence_score}%")
+        app.logger.info(f"  Directional Signals Count: {directional_signals_count}")
+        app.logger.info(f"  Total Relevant Indicators: {total_relevant_indicators}")
+        app.logger.info(f"  Calculated Confidence Score (based on directional signals): {calculated_confidence_score}%")
 
-        # --- Determine final signal strength based on overall bias and confidence ---
         if overall_bias == "NEUTRAL":
-            if calculated_confidence_score >= 60: # If high confidence of ANY direction on lowest TF despite neutral overall bias
-                # Check for majority bullish/bearish details for a cautious signal
+            if calculated_confidence_score >= 60:
                 num_bullish_details = sum(1 for detail in confirmation_details if "bullish" in detail.lower() or "overbought" in detail.lower() or "above EMA9" in detail)
                 num_bearish_details = sum(1 for detail in confirmation_details if "bearish" in detail.lower() or "oversold" in detail.lower() or "below EMA9" in detail)
 
@@ -749,15 +692,15 @@ def apply_ormcr_logic(analysis_data, selected_indicators_from_frontend):
                     calculated_signal_strength = "CAUTIOUS SELL"
                     entry_suggestion = "MONITOR (Cautious bearish signal on lowest TF)"
                     confirmation_status = "NEUTRAL BIAS, CAUTIOUS SIGNAL"
-                else: # Balanced or no strong majority on lowest TF
+                else:
                     calculated_signal_strength = "NEUTRAL"
                     entry_suggestion = "MONITOR"
                     confirmation_status = "PENDING"
-            else: # Low confidence with neutral overall bias
+            else:
                 calculated_signal_strength = "NEUTRAL"
                 entry_suggestion = "MONITOR"
                 confirmation_status = "PENDING"
-        elif calculated_confidence_score < 40: # Low confidence overrides even strong overall bias
+        elif calculated_confidence_score < 40:
             calculated_signal_strength = "NEUTRAL"
             entry_suggestion = "MONITOR"
             confirmation_status = "PENDING"
@@ -771,7 +714,7 @@ def apply_ormcr_logic(analysis_data, selected_indicators_from_frontend):
                 entry_suggestion = "ENTER NOW"
                 confirmation_status = "CONFIRMED"
             else:
-                calculated_signal_strength = "MONITOR" # Even with bullish bias, if confidence is low, still monitor
+                calculated_signal_strength = "MONITOR"
                 entry_suggestion = "MONITOR"
                 confirmation_status = "PENDING"
         elif overall_bias == "DOWNTREND":
@@ -784,49 +727,25 @@ def apply_ormcr_logic(analysis_data, selected_indicators_from_frontend):
                 entry_suggestion = "ENTER NOW"
                 confirmation_status = "CONFIRMED"
             else:
-                calculated_signal_strength = "MONITOR" # Even with bearish bias, if confidence is low, still monitor
+                calculated_signal_strength = "MONITOR"
                 entry_suggestion = "MONITOR"
                 confirmation_status = "PENDING"
 
-        # Calculate SL/TP prices based on entry_suggestion and ATR
         if entry_suggestion == "ENTER NOW" and isinstance(last_close_lowest, (int, float)):
-            if isinstance(atr_lowest, (int, float)) and atr_lowest > 0: # Ensure ATR is a positive number
-                # Use ATR for dynamic SL/TP calculation
-                # For scalp trades, usually smaller multipliers
-                print(f"DEBUG: Using ATR ({atr_lowest}) for SL/TP calculation.")
-                if calculated_signal_strength in ["BUY", "STRONG BUY", "CAUTIOUS BUY"]: # Bullish trade
-                    sl_price = round(last_close_lowest - (atr_lowest * 0.5), 2) # 0.5 ATR below close
-                    tp1_price = round(last_close_lowest + (atr_lowest * 1), 2) # 1 ATR above close
-                    tp2_price = round(last_close_lowest + (atr_lowest * 2), 2) # 2 ATR above close
-                    # Ensure SL is not above entry for long, and vice-versa
-                    sl_price = min(sl_price, last_close_lowest) # Ensure SL for long is below current price (safety)
-                elif calculated_signal_strength in ["SELL", "STRONG SELL", "CAUTIOUS SELL"]: # Bearish trade
-                    sl_price = round(last_close_lowest + (atr_lowest * 0.5), 2) # 0.5 ATR above close
-                    tp1_price = round(last_close_lowest - (atr_lowest * 1), 2) # 1 ATR below close
-                    tp2_price = round(last_close_lowest - (atr_lowest * 2), 2) # 2 ATR below close
-                    sl_price = max(sl_price, last_close_lowest) # Ensure SL for short is above current price (safety)
-                
-                # Calculate percentage change for SL/TP
-                if last_close_lowest != 0:
-                    sl_percent_change = round(((sl_price - last_close_lowest) / last_close_lowest) * 100, 2)
-                    tp1_percent_change = round(((tp1_price - last_close_lowest) / last_close_lowest) * 100, 2)
-                    tp2_percent_change = round(((tp2_price - last_close_lowest) / last_close_lowest) * 100, 2)
-                else:
-                    sl_percent_change, tp1_percent_change, tp2_percent_change = "N/A", "N/A", "N/A"
-
-                risk_in_points = round(abs(last_close_lowest - sl_price), 2)
-                position_size_suggestion = "Calculated based on 2.5% risk (example)" # Placeholder, full calculation depends on balance and actual risk tolerance
+            if isinstance(atr_lowest, (int, float)) and atr_lowest > 0: # This will be N/A, so fallback will be used
+                app.logger.info(f"DEBUG: Using ATR ({atr_lowest}) for SL/TP calculation. (This will not run due to N/A ATR)")
+                pass # This block is skipped as ATR will be N/A
             else: # Fallback to fixed percentages if ATR is not available or invalid
                 confirmation_details.append("ATR data not available or invalid for dynamic SL/TP, using fixed percentages.")
-                print(f"DEBUG: Falling back to fixed percentages for SL/TP as ATR is not valid ({atr_lowest}).")
-                if calculated_signal_strength in ["BUY", "STRONG BUY", "CAUTIOUS BUY"]: # Bullish trade
-                    sl_price = round(last_close_lowest * 0.995, 2) # 0.5% risk
-                    tp1_price = round(last_close_lowest * 1.01, 2) # 1% gain
-                    tp2_price = round(last_close_lowest * 1.02, 2) # 2% gain
-                elif calculated_signal_strength in ["SELL", "STRONG SELL", "CAUTIOUS SELL"]: # Bearish trade
-                    sl_price = round(last_close_lowest * 1.005, 2) # 0.5% risk
-                    tp1_price = round(last_close_lowest * 0.99, 2) # 1% gain
-                    tp2_price = round(last_close_lowest * 0.98, 2) # 2% gain
+                app.logger.info(f"DEBUG: Falling back to fixed percentages for SL/TP as ATR is not valid ({atr_lowest}).")
+                if calculated_signal_strength in ["BUY", "STRONG BUY", "CAUTIOUS BUY"]:
+                    sl_price = round(last_close_lowest * 0.995, 2)
+                    tp1_price = round(last_close_lowest * 1.01, 2)
+                    tp2_price = round(last_close_lowest * 1.02, 2)
+                elif calculated_signal_strength in ["SELL", "STRONG SELL", "CAUTIOUS SELL"]:
+                    sl_price = round(last_close_lowest * 1.005, 2)
+                    tp1_price = round(last_close_lowest * 0.99, 2)
+                    tp2_price = round(last_close_lowest * 0.98, 2)
                 
                 if last_close_lowest != 0:
                     sl_percent_change = round(((sl_price - last_close_lowest) / last_close_lowest) * 100, 2)
@@ -846,13 +765,12 @@ def apply_ormcr_logic(analysis_data, selected_indicators_from_frontend):
             position_size_suggestion = "User to calculate"
             sl_percent_change, tp1_percent_change, tp2_percent_change = "N/A", "N/A", "N/A"
         
-        print(f"  Confidence Score: {calculated_confidence_score}%")
-        print(f"  Signal Strength: {calculated_signal_strength}")
-        print(f"  Confirmation Status: {confirmation_status}")
-    else: # If lowest_tf_key_for_calc was empty or invalid at the beginning of the function
-        # This block handles cases where even the initial lowest TF data fetch failed or was insufficient
+        app.logger.info(f"  Confidence Score: {calculated_confidence_score}%")
+        app.logger.info(f"  Signal Strength: {calculated_signal_strength}")
+        app.logger.info(f"  Confirmation Status: {confirmation_status}")
+    else:
         confirmation_reason = "No valid data could be fetched for the lowest selected timeframe for detailed confirmation."
-        calculated_confidence_score = 30 # Default low confidence
+        calculated_confidence_score = 30
         calculated_signal_strength = "NEUTRAL"
         entry_suggestion = "MONITOR"
         confirmation_status = "PENDING"
@@ -863,13 +781,12 @@ def apply_ormcr_logic(analysis_data, selected_indicators_from_frontend):
         position_size_suggestion = "User to calculate"
         sl_percent_change, tp1_percent_change, tp2_percent_change = "N/A", "N/A", "N/A"
 
-        print(f"  Confirmation Reason: {confirmation_reason}")
+        app.logger.info(f"  Confirmation Reason: {confirmation_reason}")
         
-    print(f"--- ORMCR Logic Finished ---")
+    app.logger.info(f"--- ORMCR Logic Finished ---")
     
-    # Final confirmation reason combines all details, ensuring it's not empty
     final_confirmation_reason = ". ".join([detail for detail in confirmation_details if detail])
-    if not final_confirmation_reason: # Fallback if no details were added to the list
+    if not final_confirmation_reason:
         final_confirmation_reason = "No specific confirmation details generated."
 
     return {
@@ -892,9 +809,14 @@ def apply_ormcr_logic(analysis_data, selected_indicators_from_frontend):
 
 @app.route('/run_ormcr_analysis', methods=['POST'])
 def run_ormcr_analysis():
+    # Access global models
+    global gemini_model, bybit_client
+
     if not gemini_model:
+        app.logger.error("Gemini model not initialized for ORMCR analysis endpoint.")
         return jsonify({"error": "Gemini model not initialized"}), 500
     if not bybit_client:
+        app.logger.error("Bybit client not initialized for ORMCR analysis endpoint.")
         return jsonify({"error": "Bybit client not initialized"}), 500
 
     data = request.json
@@ -912,7 +834,6 @@ def run_ormcr_analysis():
     if not valid_timeframes:
         return jsonify({"error": "No valid timeframes provided"}), 400
     
-    # Sort timeframes for consistent trend analysis (highest to lowest)
     valid_timeframes.sort(key=lambda x: int(BYBIT_INTERVAL_MAP[x]["interval"]) if BYBIT_INTERVAL_MAP[x]["interval"].isdigit() else 999999, reverse=True)
 
 
@@ -923,9 +844,10 @@ def run_ormcr_analysis():
         df = fetch_real_ohlcv(bybit_symbol, tf)
         
         if df.empty:
-            print(f"Skipping {tf} due to empty DataFrame after fetching real data.")
+            app.logger.warning(f"Skipping {tf} due to empty DataFrame after fetching real data.")
             continue
 
+        # df_with_indicators will contain placeholder columns, not calculated values
         df_with_indicators = calculate_indicators_for_df(df, indicators)
         
         last_price_val = get_indicator_value(df_with_indicators, 'close')
@@ -948,14 +870,14 @@ def run_ormcr_analysis():
     detailed_tf_data_for_prompt = {}
     for tf, data in analysis_data_by_tf.items():
         indicators_snapshot_dict = {}
-        # Updated to match actual pandas_ta naming and include common indicator outputs
+        # Ensure these are now correctly referencing placeholder columns that will be N/A
         indicator_cols = [
             'RSI_14', 'MACD_12_26_9', 'MACDh_12_26_9', 'MACDs_12_26_9', 
             'EMA_9', 'SMA_20', 'EMA_50',
             'BBL_5_2.0', 'BBM_5_2.0', 'BBU_5_2.0', 'BBB_5_2.0', 'BBP_5_2.0',
             'STOCHk_14_3_3', 'STOCHd_14_3_3',
-            'ATR_14', 'ATRr_14', # Include raw ATR and normalized ATR
-            'volume' # Include volume as an "indicator"
+            'ATR_14', 'ATRr_14',
+            'volume'
         ]
         for ind_col in indicator_cols:
             indicators_snapshot_dict[ind_col] = get_indicator_value(data["df"], ind_col)
@@ -966,15 +888,15 @@ def run_ormcr_analysis():
             "indicators_snapshot": indicators_snapshot_dict
         }
     
-    print(f"\n--- Indicators Snapshot before sending to Gemini ---")
-    print(json.dumps(detailed_tf_data_for_prompt, indent=2))
-    print("-" * 40)
+    app.logger.info(f"\n--- Indicators Snapshot before sending to Gemini ---")
+    app.logger.info(json.dumps(detailed_tf_data_for_prompt, indent=2))
+    app.logger.info("-" * 40)
 
 
     prompt_parts = [
         "You are Aura, an advanced AI trading assistant specializing in the ORMCR strategy.",
         "Your goal is to provide insightful, helpful, and **friendly** analysis results. Adopt a **conversational, approachable, and encouraging tone**. Avoid overly formal or robotic language.",
-        "You can use emojis if appropriate to convey friendliness (e.g., 👋😊).",
+        "You can use emojis if appropriate to convey friendliness (e.g., 🚀🌟).",
         "The user has requested an analysis for:",
         f"- Currency Pair: {currency_pair}",
         f"- Selected Timeframes (highest to lowest): {', '.join(valid_timeframes)}",
@@ -992,7 +914,7 @@ def run_ormcr_analysis():
         {
             "confidence_score": "X%",
             "signal_strength": "STRONG BUY/BUY/NEUTRAL/SELL/STRONG SELL/CAUTIOUS BUY/CAUTIOUS SELL",
-            "market_summary": "Detailed summary based on multi-timeframe trend, price action, and key indicators. Explain the overall bias (e.g., 'The D1 timeframe shows an Uptrend...'), and then discuss the lowest timeframe's alignment with this bias or its own short-term signals.",
+            "market_summary": "Detailed summary based on multi-timeframe trend, price action, and key indicators. Explain the overall bias (e.g., 'The D1 timeframe shows an Uptrend...'), and then discuss the lowest timeframe's alignment with this bias or its own short-term signals. Be aware that indicator values may be N/A if not calculated by the backend.",
             "ai_suggestion": {
                 "entry_type": "BUY ORDER/SELL ORDER/WAIT",
                 "recommended_action": "ENTER NOW/MONITOR/AVOID",
@@ -1010,7 +932,7 @@ def run_ormcr_analysis():
                 "price": "$X.XX",
                 "percentage_change": "X.XX%"
             },
-            "technical_indicators_analysis": "Based on the 'indicators_snapshot' provided in 'detailed_timeframe_data', interpret the values for all selected indicators (RSI, MACD, Stochastic, Moving Averages, Bollinger Bands, Volume, ATR, Fibonacci Retracements if applicable) across the relevant timeframes, focusing on the lowest timeframe for potential entry signals. Explain what each indicator suggests about market conditions (e.g., overbought/oversold for RSI, momentum for MACD, volatility for Bollinger Bands, etc.). For each indicator that was selected, explain its reading and what it implies for the current market state. If an indicator was not selected or its data was not available, you can briefly mention that it was not included in this specific analysis.",
+            "technical_indicators_analysis": "Based on the 'indicators_snapshot' provided in 'detailed_timeframe_data', interpret the values for all selected indicators (RSI, MACD, Stochastic, Moving Averages, Bollinger Bands, Volume, ATR, Fibonacci Retracements if applicable) across the relevant timeframes, focusing on the lowest timeframe for potential entry signals. Explain what each indicator suggests about market conditions (e.g., overbought/oversold for RSI, momentum for MACD, volatility for Bollinger Bands, etc.). For each indicator that was selected, explain its reading and what it implies for the current market state. **Crucially, if an indicator's value is 'N/A' (because pandas_ta is not used), clearly state that it was not calculated by the backend and therefore not included in the numerical analysis, but you can still provide general context for what it normally signifies.**",
             "next_step_for_user": "What the user should do next (e.g., 'Monitor for confirmation', 'Proceed with the trade', 'Review other timeframes', 'Consider a cautious entry')."
         }
         """,
@@ -1021,7 +943,7 @@ def run_ormcr_analysis():
         f"- For stop_loss and take_profit, use the calculated 'sl_price', 'tp1_price', 'tp2_price' and their corresponding 'sl_percent_change', 'tp1_percent_change', 'tp2_percent_change' from 'ormcr_analysis'. If these are 'N/A', represent them as 'N/A'.",
         f"- If 'ormcr_confirmation_status' is 'PENDING', ensure 'entry_type' is 'WAIT' and 'recommended_action' is 'MONITOR', and provide 'N/A' for SL/TP prices and percentages.",
         f"- Ensure 'market_summary' and 'next_step_for_user' are coherent and actionable based on the analysis.",
-        "\n**IMPORTANT: Maintain a friendly, conversational, and encouraging tone throughout your response. Use simple, clear language and feel free to include relevant emojis to enhance friendliness (e.g., 👋😊).**"
+        "\n**IMPORTANT: Maintain a friendly, conversational, and encouraging tone throughout your response. Use simple, clear language and feel free to include relevant emojis to enhance friendliness (e.g., 🚀🌟).**"
     ]
 
     try:
@@ -1103,4 +1025,3 @@ if __name__ == '__main__':
     # This block is primarily for local development.
     # For Render deployment, Gunicorn will handle starting the Flask application.
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)), debug=False)
- 
