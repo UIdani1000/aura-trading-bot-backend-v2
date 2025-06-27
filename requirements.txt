@@ -21,13 +21,8 @@ python-dotenv
 
 # Data Analysis and Time Handling
 pandas==2.2.3
-# UPDATE THIS LINE:
-pandas_ta==0.3.14.99 # Changed from 0.3.14b0
 numpy==1.26.4
 python-dateutil==2.9.0.post0
 pytz==2025.2
 six==1.17.0
 tzdata==2025.2
-
-# Fix for ModuleNotFoundError: No module named 'pkg_resources' (kept for safety, might not be needed with new pandas_ta)
-setuptools==69.5.1
