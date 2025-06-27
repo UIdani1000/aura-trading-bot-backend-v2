@@ -1103,3 +1103,4 @@ if __name__ == '__main__':
     # This block is primarily for local development.
     # For Render deployment, Gunicorn will handle starting the Flask application.
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 10000)), debug=False)
+ 
